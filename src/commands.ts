@@ -1,5 +1,6 @@
 import { Notice, Platform, TFolder, WorkspaceLeaf } from "obsidian";
 import { HISTORY_VIEW_CONFIG, SOURCE_CONTROL_VIEW_CONFIG } from "./constants";
+import { IsomorphicGit } from "./gitManager/isomorphicGit";
 import { SimpleGit } from "./gitManager/simpleGit";
 import ObsidianGit from "./main";
 import { openHistoryInGitHub, openLineInGitHub } from "./openInGitHub";
@@ -556,6 +557,89 @@ export function addCommmands(plugin: ObsidianGit) {
                 );
             }
             plugin.hunkActions.goToHunk("prev");
+        },
+    });
+
+    plugin.addCommand({
+        id: "git-diagnostics",
+        name: "Git repository diagnostics",
+        callback: async () => {
+            const lines: string[] = [];
+            lines.push("Git Diagnostics");
+            lines.push(`Platform: ${Platform.isDesktopApp ? "Desktop" : Platform.isMobileApp ? "Mobile" : "Unknown"}`);
+            lines.push(
+                `Backend: ${plugin.gitManager instanceof SimpleGit ? "SimpleGit" : plugin.gitManager instanceof IsomorphicGit ? "IsomorphicGit" : "None"}`
+            );
+            lines.push(`Base path: "${plugin.settings.basePath || "(empty)"}"`);
+            lines.push(`Git dir setting: "${plugin.settings.gitDir || "(empty)"}"`);
+
+            if (plugin.gitManager instanceof IsomorphicGit) {
+                const isoGit = plugin.gitManager as IsomorphicGit;
+                const { dir, gitdir } = isoGit.getRepo();
+                lines.push(`Resolved dir: "${dir || "(empty)"}"`);
+                lines.push(`Resolved gitdir: "${gitdir || "(not set)"}"`);
+
+                // Check HEAD using the MyAdapter (which handles paths inside and outside the vault)
+                const headPath = gitdir
+                    ? `${gitdir}/HEAD`
+                    : dir.length > 0
+                      ? `${dir}/.git/HEAD`
+                      : `.git/HEAD`;
+                lines.push(`HEAD path: "${headPath}"`);
+                let headExists = false;
+                try {
+                    // Use the fs adapter's lstat (aliased to stat) for proper path handling
+                    await isoGit["fs"].lstat(headPath);
+                    headExists = true;
+                } catch {
+                    headExists = false;
+                }
+                lines.push(`HEAD exists: ${headExists}`);
+
+                // Also try parent-relative path for split vault/git setups
+                if (!headExists && gitdir && !gitdir.startsWith(".")) {
+                    const altPath = `../.git/HEAD`;
+                    lines.push(`Trying alt HEAD: "${altPath}"`);
+                    try {
+                        await isoGit["fs"].lstat(altPath);
+                        lines.push(`Alt HEAD exists: YES (use gitDir: "../.git" ?)`);
+                    } catch {
+                        lines.push(`Alt HEAD exists: NO`);
+                    }
+                }
+
+                const dotGitPath = gitdir || `${dir ? dir + "/" : ""}.git`;
+                let dotGitExists = false;
+                try {
+                    await isoGit["fs"].lstat(dotGitPath);
+                    dotGitExists = true;
+                } catch {
+                    dotGitExists = false;
+                }
+                lines.push(`Git dir exists at "${dotGitPath}": ${dotGitExists}`);
+            }
+
+            if (plugin.gitReady && plugin.gitManager) {
+                try {
+                    const remotes = await plugin.gitManager.getRemotes();
+                    lines.push(`Remotes: ${remotes.length > 0 ? remotes.join(", ") : "(none)"}`);
+                } catch {
+                    lines.push("Remotes: (error)");
+                }
+                try {
+                    const branchInfo = await plugin.gitManager.branchInfo();
+                    lines.push(`Branch: ${branchInfo.current || "(detached)"}`);
+                } catch {
+                    lines.push("Branch: (error)");
+                }
+            } else {
+                lines.push("Git not ready — skipping remote/branch checks");
+            }
+
+            // Show in a Notice. On mobile, chunk to fit screen if needed.
+            const output = lines.join("\n");
+            console.log(output);
+            new Notice(output, 0);
         },
     });
 }

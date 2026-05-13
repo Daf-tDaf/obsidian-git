@@ -124,6 +124,29 @@ export class LocalStorageSettings {
         );
     }
 
+    getRemoteUrls(): Record<string, string> {
+        try {
+            return JSON.parse(
+                this.app.loadLocalStorage(this.prefix + "remoteUrls") ?? "{}"
+            ) as Record<string, string>;
+        } catch {
+            return {};
+        }
+    }
+
+    setRemoteUrl(name: string, url: string): void {
+        const urls = this.getRemoteUrls();
+        urls[name] = url;
+        this.app.saveLocalStorage(
+            this.prefix + "remoteUrls",
+            JSON.stringify(urls)
+        );
+    }
+
+    getRemoteUrl(name: string): string | null {
+        return this.getRemoteUrls()[name] ?? null;
+    }
+
     getPluginDisabled(): boolean {
         return (
             this.app.loadLocalStorage(this.prefix + "pluginDisabled") == "true"

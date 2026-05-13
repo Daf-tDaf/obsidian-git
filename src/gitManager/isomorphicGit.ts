@@ -66,10 +66,23 @@ export class IsomorphicGit extends GitManager {
         onAuthFailure: AuthFailureCallback;
         http: HttpClient;
     } {
+        let gitdir = this.plugin.settings.gitDir || undefined;
+        // Normalize: if gitdir looks like an absolute path missing its leading
+        // '/' (common on Android where users type "storage/emulated/0/..."),
+        // prepend the '/'. We detect this by checking if the path contains
+        // multiple segments and doesn't start with '.' or '/'.
+        if (
+            gitdir &&
+            !gitdir.startsWith("/") &&
+            !gitdir.startsWith(".") &&
+            gitdir.split("/").length >= 3
+        ) {
+            gitdir = "/" + gitdir;
+        }
         return {
             fs: this.fs,
             dir: this.plugin.settings.basePath,
-            gitdir: this.plugin.settings.gitDir || undefined,
+            gitdir,
             onAuth: () => {
                 return {
                     username:
@@ -573,11 +586,13 @@ export class IsomorphicGit extends GitManager {
 
             this.plugin.setPluginState({ gitAction: CurrentGitAction.push });
             const remote = await this.getCurrentRemote();
+            const url = await this.getRemoteUrl(remote);
 
             await this.wrapFS(
                 git.push({
                     ...this.getRepo(),
                     remote,
+                    url: url || undefined,
                     onProgress: (progress) => {
                         if (progressNotice !== undefined) {
                             progressNotice.noticeEl.innerText =
@@ -627,9 +642,48 @@ export class IsomorphicGit extends GitManager {
     }
 
     async checkRequirements(): Promise<"valid" | "missing-repo"> {
-        const headExists = await this.plugin.app.vault.adapter.exists(
-            `${this.getRepo().dir}/.git/HEAD`
+        const { dir, gitdir } = this.getRepo();
+        let headPath: string;
+        if (gitdir) {
+            headPath = `${gitdir}/HEAD`;
+        } else if (dir.length > 0) {
+            headPath = `${dir}/.git/HEAD`;
+        } else {
+            headPath = `.git/HEAD`;
+        }
+
+        this.plugin.log(
+            `[checkRequirements] Checking for git repo: dir="${dir}", gitdir="${gitdir || ".git"}", headPath="${headPath}"`
         );
+
+        // Use MyAdapter.stat() instead of vault.adapter.exists() because
+        // MyAdapter falls back to the native adapter for paths outside the vault,
+        // which is essential when gitDir points outside the vault root.
+        let headExists = false;
+        try {
+            await this.fs.stat(headPath);
+            headExists = true;
+        } catch (e: any) {
+            if (e?.code !== "ENOENT") {
+                this.plugin.log(
+                    `[checkRequirements] Error checking HEAD: ${String(e)}`
+                );
+            }
+        }
+
+        if (!headExists) {
+            let dotGitExists = false;
+            const dotGitPath = gitdir || `${dir ? dir + "/" : ""}.git`;
+            try {
+                await this.fs.stat(dotGitPath);
+                dotGitExists = true;
+            } catch {
+                // stat throws ENOENT if path doesn't exist
+            }
+            this.plugin.log(
+                `[checkRequirements] HEAD not found at "${headPath}". .git dir exists at "${dotGitPath}": ${dotGitExists}. basePath: "${this.plugin.settings.basePath}", gitDir: "${this.plugin.settings.gitDir}"`
+            );
+        }
 
         return headExists ? "valid" : "missing-repo";
     }
@@ -640,8 +694,7 @@ export class IsomorphicGit extends GitManager {
 
             const branches = await git.listBranches(this.getRepo());
 
-            const remote =
-                (await this.getConfig(`branch.${current}.remote`)) ?? "origin";
+            const remote = await this.getCurrentRemote();
 
             const trackingBranch = (
                 await this.getConfig(`branch.${current}.merge`)
@@ -666,9 +719,40 @@ export class IsomorphicGit extends GitManager {
     async getCurrentRemote(): Promise<string> {
         const current = (await git.currentBranch(this.getRepo())) || "";
 
-        const remote =
-            (await this.getConfig(`branch.${current}.remote`)) ?? "origin";
-        return remote;
+        const configuredRemote =
+            await this.getConfig(`branch.${current}.remote`);
+        if (configuredRemote) return configuredRemote;
+
+        // No branch.<name>.remote configured. Try to find a remote that
+        // tracks this branch, or fall back to the first available remote.
+        const remotes = await this.getRemotes();
+        if (remotes.length > 0) {
+            // Check if any remote has a fetch ref matching our branch
+            const mergeConfig =
+                await this.getConfig(`branch.${current}.merge`);
+            if (mergeConfig) {
+                for (const remote of remotes) {
+                    try {
+                        const branches =
+                            await this.getRemoteBranches(remote);
+                        const trackingRef = mergeConfig.replace(
+                            "refs/heads/",
+                            ""
+                        );
+                        if (
+                            branches.includes(remote + "/" + trackingRef)
+                        ) {
+                            return remote;
+                        }
+                    } catch {
+                        // Skip remotes we can't fetch from
+                    }
+                }
+            }
+            // Fall back to the first available remote
+            return remotes[0];
+        }
+        return "origin";
     }
 
     async checkout(branch: string, remote?: string): Promise<void> {
@@ -781,8 +865,10 @@ export class IsomorphicGit extends GitManager {
 
     async fetch(remote?: string): Promise<void> {
         const progressNotice = this.showNotice("Initializing fetch");
+        const remoteName = remote ?? (await this.getCurrentRemote());
 
         try {
+            const url = await this.getRemoteUrl(remoteName);
             const args = {
                 ...this.getRepo(),
                 onProgress: (progress: GitProgressEvent) => {
@@ -791,7 +877,8 @@ export class IsomorphicGit extends GitManager {
                             this.getProgressText("Fetching", progress);
                     }
                 },
-                remote: remote ?? (await this.getCurrentRemote()),
+                remote: remoteName,
+                url: url || undefined,
             };
 
             await this.wrapFS(git.fetch(args));
@@ -804,6 +891,10 @@ export class IsomorphicGit extends GitManager {
     }
 
     async setRemote(name: string, url: string): Promise<void> {
+        // Store in local storage as a fallback (essential on Android where
+        // the git config file may not be writable from within the vault
+        // adapter's sandbox).
+        this.plugin.localStorage.setRemoteUrl(name, url);
         try {
             await this.wrapFS(
                 git.addRemote({
@@ -814,8 +905,11 @@ export class IsomorphicGit extends GitManager {
                 })
             );
         } catch (error) {
-            this.plugin.displayError(error);
-            throw error;
+            // If writing to git config fails (e.g. Android scoped storage),
+            // the local storage fallback above means the remote is still usable.
+            this.plugin.log(
+                `[setRemote] git.addRemote failed, using local storage fallback: ${error}`
+            );
         }
     }
 
@@ -835,9 +929,15 @@ export class IsomorphicGit extends GitManager {
     }
 
     async getRemotes(): Promise<string[]> {
-        return (await this.wrapFS(git.listRemotes({ ...this.getRepo() }))).map(
-            (remoteUrl) => remoteUrl.remote
+        const fromConfig = (
+            await this.wrapFS(git.listRemotes({ ...this.getRepo() }))
+        ).map((remoteUrl) => remoteUrl.remote);
+        // Also include remotes stored in local storage (Android fallback
+        // where git config may not be readable outside the vault).
+        const fromStorage = Object.keys(
+            this.plugin.localStorage.getRemoteUrls()
         );
+        return [...new Set([...fromConfig, ...fromStorage])];
     }
 
     async removeRemote(remoteName: string): Promise<void> {
@@ -847,9 +947,16 @@ export class IsomorphicGit extends GitManager {
     }
 
     async getRemoteUrl(remote: string): Promise<string | undefined> {
-        return (
+        // Try git config first
+        const fromConfig = (
             await this.wrapFS(git.listRemotes({ ...this.getRepo() }))
         ).filter((item) => item.remote == remote)[0]?.url;
+        if (fromConfig) return fromConfig;
+        // Fall back to local storage (Android where git config may not be
+        // readable outside the vault).
+        return (
+            this.plugin.localStorage.getRemoteUrl(remote) ?? undefined
+        );
     }
 
     async log(
@@ -899,23 +1006,40 @@ export class IsomorphicGit extends GitManager {
         );
     }
 
-    updateBasePath(basePath: string): Promise<void> {
-        this.getRepo().dir = basePath;
+    updateBasePath(_basePath: string): Promise<void> {
+        // getRepo() reads basePath from plugin.settings each call,
+        // and settings are updated before this method is invoked,
+        // so no state mutation is needed here.
         return Promise.resolve();
     }
 
     async updateUpstreamBranch(remoteBranch: string): Promise<void> {
         const [remote, branch] = splitRemoteBranch(remoteBranch);
         const branchInfo = await this.branchInfo();
+        const url = await this.getRemoteUrl(remote);
 
-        await this.wrapFS(
-            git.push({
-                ...this.getRepo(),
-                remote: remote,
-                remoteRef: branch,
-            })
+        // Try to push to create the remote branch (git push -u equivalent).
+        // If push fails (e.g. remote has diverged), still set the upstream
+        // config so the user can pull first and reconcile.
+        try {
+            await this.wrapFS(
+                git.push({
+                    ...this.getRepo(),
+                    remote: remote,
+                    remoteRef: branch,
+                    url: url || undefined,
+                })
+            );
+        } catch (e) {
+            this.plugin.log(
+                `[updateUpstreamBranch] Push failed, setting upstream anyway: ${e}`
+            );
+        }
+
+        await this.setConfig(
+            `branch.${branchInfo.current}.remote`,
+            remote
         );
-
         await this.setConfig(
             `branch.${branchInfo.current}.merge`,
             `refs/heads/${branch}`
