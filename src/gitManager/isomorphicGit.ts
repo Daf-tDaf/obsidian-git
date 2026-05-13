@@ -10,8 +10,14 @@ import type {
     WalkerMap,
 } from "isomorphic-git";
 import git, { Errors, readBlob } from "isomorphic-git";
-import { Notice, requestUrl } from "obsidian";
+import { Notice, Platform, requestUrl } from "obsidian";
 import type ObsidianGit from "../main";
+import {
+    classifyHttpError,
+    isTransientMessage,
+    NetworkError,
+    ResponseTooLargeError,
+} from "../networkErrors";
 import type {
     BranchInfo,
     FileStatusResult,
@@ -129,13 +135,53 @@ export class IsomorphicGit extends GitManager {
                         collectedBody = await asyncIteratorToArrayBuffer(body);
                     }
 
-                    const res = await requestUrl({
-                        url,
-                        method,
-                        headers,
-                        body: collectedBody,
-                        throw: false,
-                    });
+                    let res;
+                    try {
+                        res = await requestUrl({
+                            url,
+                            method,
+                            headers,
+                            body: collectedBody,
+                            throw: false,
+                        });
+                    } catch (e) {
+                        // Network-level failure (DNS, timeout, etc.)
+                        const classification = classifyHttpError(e);
+                        const message = `Git: Network error — ${isTransientMessage(classification)} (${url})`;
+                        throw new NetworkError(message);
+                    }
+
+                    // HTTP error status codes
+                    if (res.status >= 400) {
+                        const err = new Error(
+                            `HTTP Error: ${res.status} ${res.status.toString()} for ${url}`
+                        );
+                        const classification = classifyHttpError(err);
+                        if (
+                            classification === "dns" ||
+                            classification === "timeout" ||
+                            classification === "connection-refused" ||
+                            classification === "connection-reset" ||
+                            classification === "unreachable"
+                        ) {
+                            throw new NetworkError(
+                                `Git: Network error — ${isTransientMessage(classification)}`
+                            );
+                        }
+                        // Auth errors, not-found, server errors — let
+                        // isomorphic-git handle them normally so onAuthFailure
+                        // can prompt for new credentials.
+                    }
+
+                    // Response size check (prevents OOM on mobile)
+                    const responseSize = res.arrayBuffer.byteLength;
+                    const maxSize = 100 * 1024 * 1024; // 100MB default
+                    if (responseSize > maxSize) {
+                        throw new ResponseTooLargeError(
+                            responseSize,
+                            maxSize
+                        );
+                    }
 
                     return {
                         url,

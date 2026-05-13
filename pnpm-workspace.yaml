@@ -1,0 +1,6 @@
+allowBuilds:
+  '@parcel/watcher': true
+onlyBuiltDependencies:
+  - esbuild
+  - svelte-preprocess
+  - '@parcel/watcher'

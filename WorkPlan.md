@@ -306,6 +306,43 @@ On mobile, existing merge conflicts are only detected during commit attempts (no
 
 **Human gate:** User tests pull/push/clone with network disconnection on Samsung Note 10+.
 
+#### Stage 1 Work Log (2026-05-12)
+
+**Device:** Samsung Note 10+ (Android) connected via USB/ADB to M1 MacBook Pro
+**Vault:** `personalVault` (git repo inside vault, flattened from Stage 0)
+
+**Changes made:**
+
+1. **Operation timeouts — [promiseQueue.ts](src/promiseQueue.ts)**
+   - Rewrote `PromiseQueue` with dual API: legacy `addTask()` (unchanged) and new `addTaskAsync()` returning a `Promise<T>`
+   - `addTaskAsync()` supports per-task `timeoutMs` and a queue-level `defaultTimeoutMs` constructor option
+   - On timeout, the task's `AbortController` fires and a `TimeoutError` is thrown (rejected via Promise, not shown as a plugin error popup)
+   - Non-timeout errors still go through `displayError()` for user visibility
+
+2. **Per-operation abort controller — [promiseQueue.ts](src/promiseQueue.ts)**
+   - Each queued task gets an `AbortController`; its `AbortSignal` is passed via `TaskContext.signal`
+   - Callers can check `signal.aborted` to bail out early in long operations
+
+3. **HTTP response size limiting — [isomorphicGit.ts](src/gitManager/isomorphicGit.ts)**
+   - After receiving HTTP response, checks `res.arrayBuffer.byteLength` against a 100MB max
+   - Throws `ResponseTooLargeError` if exceeded — prevents OOM crashes on mobile during clone/pull of large repos
+
+4. **Network error detection for isomorphic-git — [isomorphicGit.ts](src/gitManager/isomorphicGit.ts) + [networkErrors.ts](src/networkErrors.ts)**
+   - New `networkErrors.ts` module with `classifyHttpError()`, `NetworkError`, `ResponseTooLargeError`, `isTransientMessage()`
+   - `classifyHttpError()` detects: DNS failure, timeout, connection refused/reset, SSL errors, unreachable host
+   - `requestUrl` call wrapped in try/catch: network-level failures throw `NetworkError` with user-friendly message
+   - HTTP status ≥ 400 classified; network-transient errors throw `NetworkError`, auth/not-found errors fall through to isomorphic-git's `onAuthFailure` callback
+   - Ports the `NoNetworkError` pattern from SimpleGit to the isomorphic-git codepath
+
+**What was NOT implemented (deferred):**
+- **1.3 Memory pressure monitoring** — no cross-platform API available; response size limit (1.4) serves as the primary guard
+- Cancel button on long-operation notices — the abort signal infrastructure is in place but UI wiring deferred to Stage 4 (UX)
+
+**Human validation (2026-05-12):**
+- ✅ Plugin loads and finds repo on Samsung Note 10+
+- ✅ Perceived performance improvement (likely from error classification short-circuiting)
+- ✅ No crashes observed in basic operations
+
 ---
 
 ### Stage 2: Memory Optimization
